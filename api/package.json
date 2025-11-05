@@ -1,0 +1,8 @@
+{
+  "name": "gemini-jeopardy-api",
+  "version": "0.0.1",
+  "type": "module",
+  "dependencies": {
+    "@google/genai": "^1.27.0"
+  }
+}

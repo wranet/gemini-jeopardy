@@ -1,186 +1,119 @@
-// This service handles communication with the Google Gemini API to generate game data.
-import { GoogleGenAI, Type } from "@google/genai";
-import type { GameData, FinalJeopardyQuestion } from '../types';
+// This service communicates with the Azure Functions backend to generate Jeopardy content.
+import type { GameData, FinalJeopardyQuestion } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+type ContextPayload = { type: "pdf" | "text"; data: string };
 
-const gameDataSchema = {
-  type: Type.ARRAY,
-  items: {
-    type: Type.OBJECT,
-    properties: {
-      title: {
-        type: Type.STRING,
-        description: 'The category title.',
-      },
-      questions: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            clue: {
-              type: Type.STRING,
-              description: 'The clue for the question, phrased as an answer.',
-            },
-            response: {
-              type: Type.STRING,
-              description: 'The correct response, phrased as a question (e.g., "What is...?").',
-            },
-            value: {
-              type: Type.NUMBER,
-              description: 'The point value of the question (e.g., 200, 400, 600, 800, 1000).',
-            },
-          },
-          required: ['clue', 'response', 'value'],
-        },
-      },
-    },
-    required: ['title', 'questions'],
-  },
-};
-
-const finalJeopardySchema = {
-    type: Type.OBJECT,
-    properties: {
-        category: {
-            type: Type.STRING,
-            description: "The category for the Final Jeopardy question."
-        },
-        clue: {
-            type: Type.STRING,
-            description: "The clue for the question, phrased as an answer."
-        },
-        response: {
-            type: Type.STRING,
-            description: "The correct response, phrased as a question (e.g., 'What is...?')."
-        }
-    },
-    required: ["category", "clue", "response"]
+interface RawQuestion {
+  clue: string;
+  response: string;
+  value: number;
 }
 
-export const generateGameData = async (
-  topic: string, 
-  context?: { type: 'pdf' | 'text', data: string }
-): Promise<GameData | null> => {
-  try {
-    let contents: any;
+interface RawCategory {
+  title: string;
+  questions: RawQuestion[];
+}
 
-    const basePrompt = `Generate a complete Jeopardy-style game board with 5 categories and 5 questions per category. The overall theme is "${topic}".
-For each question, provide a clue (phrased as an answer) and a response (phrased as a question).
-The point values for the questions in each category should be 200, 400, 600, 800, and 1000.
-Ensure the categories are distinct and the questions range in difficulty.
-Do not include a "Final Jeopardy" round.`;
+type RawGameData = RawCategory[];
 
-    if (context?.type === 'text') {
-      contents = `${basePrompt}\nUse the following text as the primary source for categories and questions:\n---\n${context.data}`;
-    } else if (context?.type === 'pdf') {
-      contents = {
-        parts: [
-          { text: `${basePrompt}\nUse the information in the attached PDF file as the primary source for categories and questions.` },
-          {
-            inlineData: {
-              mimeType: 'application/pdf',
-              data: context.data,
-            },
-          },
-        ],
-      };
-    } else {
-      contents = basePrompt;
-    }
+interface GenerateGameResponse {
+  data: RawGameData;
+}
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: contents,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: gameDataSchema,
-      },
-    });
+const API_BASE = "/api";
 
-    const jsonText = response.text.trim();
-    if (!jsonText.startsWith('[')) {
-        console.error("Invalid JSON response:", jsonText);
-        return null;
-    }
+const postJson = async <TResponse>(
+  path: string,
+  payload: Record<string, unknown>
+): Promise<TResponse> => {
+  const response = await fetch(`${API_BASE}/${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
 
-    const parsedData = JSON.parse(jsonText);
+  if (!response.ok) {
+    const message = await response.text().catch(() => "");
+    throw new Error(
+      message || `Request to ${path} failed with status ${response.status}`
+    );
+  }
 
-    // Add `answered` and `dailyDouble` properties
-    const gameData: GameData = parsedData.map((category: any) => ({
-      ...category,
-      questions: category.questions.map((q: any) => ({ ...q, answered: false, dailyDouble: false })),
-    }));
+  return (await response.json()) as TResponse;
+};
 
-    // Randomly assign two daily doubles
-    const numCategories = gameData.length;
-    if (numCategories > 0) {
-      const numQuestions = gameData[0]?.questions.length || 0;
-      if (numCategories * numQuestions >= 2) {
-        let assigned = 0;
-        const assignedCoords = new Set<string>();
-        while (assigned < 2) {
-          const randomCat = Math.floor(Math.random() * numCategories);
-          const randomQ = Math.floor(Math.random() * numQuestions);
-          const coord = `${randomCat}-${randomQ}`;
-          if (!assignedCoords.has(coord)) {
-            gameData[randomCat].questions[randomQ].dailyDouble = true;
-            assignedCoords.add(coord);
-            assigned++;
-          }
+const addClientSideMetadata = (rawData: RawGameData): GameData => {
+  const gameData: GameData = rawData.map((category) => ({
+    title: category.title,
+    questions: category.questions.map((question) => ({
+      ...question,
+      answered: false,
+      dailyDouble: false
+    }))
+  }));
+
+  const numCategories = gameData.length;
+  if (numCategories > 0) {
+    const questionsPerCategory = gameData[0]?.questions.length ?? 0;
+    if (numCategories * questionsPerCategory >= 2) {
+      let assigned = 0;
+      const picked = new Set<string>();
+      while (assigned < 2) {
+        const randomCat = Math.floor(Math.random() * numCategories);
+        const randomQuestion = Math.floor(Math.random() * questionsPerCategory);
+        const key = `${randomCat}-${randomQuestion}`;
+        if (!picked.has(key)) {
+          gameData[randomCat].questions[randomQuestion].dailyDouble = true;
+          picked.add(key);
+          assigned += 1;
         }
       }
     }
+  }
 
-    return gameData;
+  return gameData;
+};
+
+export const generateGameData = async (
+  topic: string,
+  context?: ContextPayload
+): Promise<GameData | null> => {
+  try {
+    const payload: Record<string, unknown> = { topic };
+    if (context) {
+      payload.context = context;
+    }
+
+    const { data } = await postJson<GenerateGameResponse>(
+      "generate-game",
+      payload
+    );
+
+    return addClientSideMetadata(data);
   } catch (error) {
-    console.error("Error generating game data:", error);
+    console.error("Error requesting game data:", error);
     return null;
   }
 };
 
-
 export const generateFinalJeopardyData = async (
   topic: string,
-  context?: { type: 'pdf' | 'text', data: string }
+  context?: ContextPayload
 ): Promise<FinalJeopardyQuestion | null> => {
-    try {
-        let contents: any;
-        const basePrompt = `Generate a single, challenging Final Jeopardy question based on the topic "${topic}". Provide a category, a clue (phrased as an answer), and a response (phrased as a question).`;
-
-        if (context?.type === 'text') {
-          contents = `${basePrompt}\nBase the question on the following source material:\n\n${context.data}`;
-        } else if (context?.type === 'pdf') {
-          contents = {
-            parts: [
-              { text: `${basePrompt}\nBase the question on the provided PDF file.` },
-              {
-                inlineData: {
-                  mimeType: 'application/pdf',
-                  data: context.data,
-                },
-              },
-            ],
-          };
-        } else {
-          contents = basePrompt;
-        }
-
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: contents,
-            config: {
-                responseMimeType: 'application/json',
-                responseSchema: finalJeopardySchema,
-            },
-        });
-
-        const jsonText = response.text.trim();
-        const parsedData = JSON.parse(jsonText);
-        return parsedData;
-
-    } catch (error) {
-        console.error("Error generating Final Jeopardy data:", error);
-        return null;
+  try {
+    const payload: Record<string, unknown> = { topic };
+    if (context) {
+      payload.context = context;
     }
-}
+
+    return await postJson<FinalJeopardyQuestion>(
+      "generate-final",
+      payload
+    );
+  } catch (error) {
+    console.error("Error requesting Final Jeopardy data:", error);
+    return null;
+  }
+};
